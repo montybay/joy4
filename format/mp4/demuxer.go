@@ -309,10 +309,16 @@ func (self *Demuxer) ReadPacket() (pkt av.Packet, err error) {
 	var chosen *Stream
 	var chosenidx int
 	for i, stream := range self.streams {
-		if chosen == nil || stream.tsToTime(stream.dts) < chosen.tsToTime(chosen.dts) {
+		if (chosen == nil ||
+			stream.tsToTime(stream.dts) < chosen.tsToTime(chosen.dts)) &&
+			stream.isSampleValid() {
 			chosen = stream
 			chosenidx = i
 		}
+	}
+	if chosen == nil {
+		err = io.EOF
+		return
 	}
 	if false {
 		fmt.Printf("ReadPacket: chosen index=%v time=%v\n", chosen.idx, chosen.tsToTime(chosen.dts))
