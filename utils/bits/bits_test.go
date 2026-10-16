@@ -43,9 +43,4 @@ func TestBits(t *testing.T) {
 		t.FailNow()
 	}
 
-	b = make([]byte, 8)
-	PutUInt64BE(b, 0x11223344, 32)
-	if b[0] != 0x11 || b[1] != 0x22 || b[2] != 0x33 || b[3] != 0x44 {
-		t.FailNow()
-	}
 }

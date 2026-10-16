@@ -1,3 +1,5 @@
+//go:build ffmpeg && cgo
+// +build ffmpeg,cgo
 
 package main
 

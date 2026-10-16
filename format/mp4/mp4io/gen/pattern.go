@@ -1,3 +1,7 @@
+//go:build ignore
+// +build ignore
+
+// This file is input to gen.go, not a compilable Go package.
 package main
 
 func moov_Movie() {

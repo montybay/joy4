@@ -1,11 +1,13 @@
 package sdp
 
 import (
+	"bytes"
+	"github.com/montybay/joy4/av"
 	"testing"
 )
 
 func TestParse(t *testing.T) {
-	infos := Decode(`
+	_, infos := Parse(`
 v=0
 o=- 1459325504777324 1 IN IP4 192.168.0.123
 s=RTSP/RTP stream from Network Video Server
@@ -40,5 +42,13 @@ a=rtpmap:0 PCMU/8000
 a=Media_header:MEDIAINFO=494D4B48010100000400010010710110401F000000FA000000000000000000000000000000000000;
 a=appversion:1.0
 `)
-	t.Logf("%v", infos)
+	if len(infos) != 3 {
+		t.Fatalf("media count: %d", len(infos))
+	}
+	if infos[0].Type != av.H264 || infos[0].TimeScale != 90000 || infos[0].Control != "track1" || len(infos[0].SpropParameterSets) != 2 {
+		t.Fatalf("video: %+v", infos[0])
+	}
+	if infos[1].Type != av.AAC || infos[1].TimeScale != 16000 || infos[1].Control != "track2" || !bytes.Equal(infos[1].Config, []byte{0x14, 0x08}) || infos[1].SizeLength != 13 || infos[1].IndexLength != 3 {
+		t.Fatalf("audio: %+v", infos[1])
+	}
 }

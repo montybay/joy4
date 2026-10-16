@@ -73,6 +73,20 @@ Go version >= 1.6
 
 ffmpeg version >= 3.0 (optional)
 
+# Testing and optional FFmpeg bindings
+
+Run the default suite with `go test ./...`. The FFmpeg bindings and the three
+examples that import them require an explicit `ffmpeg` build tag and CGO:
+
+```sh
+CGO_ENABLED=1 go test -tags ffmpeg ./...
+CGO_ENABLED=1 go run -tags ffmpeg ./examples/audio_decode
+```
+
+The bindings require compatible native FFmpeg development headers and libraries,
+including the legacy `libavresample` API. Enabling the tag does not install or
+update these dependencies.
+
 # TODO
 
 HLS / MPEG-DASH Server
