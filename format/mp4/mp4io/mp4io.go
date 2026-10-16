@@ -281,8 +281,8 @@ func (self ElemStreamDesc) Marshal(b []byte) (n int) {
 	pio.PutU32BE(b[n:], 0) // Version
 	n += 4
 	datalen := self.Len()
-	n += self.fillESDescHdr(b[n:], datalen-n-self.lenESDescHdr())
-	n += self.fillDecConfigDescHdr(b[n:], datalen-n-self.lenDescHdr()-1)
+	n += self.fillESDescHdr(b[n:], datalen-n-self.lenDescHdr())
+	n += self.fillDecConfigDescHdr(b[n:], self.lenDecConfigDescHdr()-self.lenDescHdr()+len(self.DecConfig))
 	copy(b[n:], self.DecConfig)
 	n += len(self.DecConfig)
 	n += self.fillDescHdr(b[n:], 0x06, datalen-n-self.lenDescHdr())
@@ -303,46 +303,63 @@ func (self *ElemStreamDesc) Unmarshal(b []byte, offset int) (n int, err error) {
 	return self.parseDesc(b[n:], offset+n)
 }
 
+// parseDesc confines every descriptor, including recursive children, to its
+// declared payload. Sibling descriptors must never become decoder config bytes.
 func (self *ElemStreamDesc) parseDesc(b []byte, offset int) (n int, err error) {
-	var hdrlen int
-	var datalen int
-	var tag uint8
-	if hdrlen, tag, datalen, err = self.parseDescHdr(b, offset); err != nil {
-		return
-	}
-	n += hdrlen
+	return self.parseDescDepth(b, offset, 0)
+}
 
-	if len(b) < n+datalen {
-		err = parseErr("datalen", offset+n, err)
-		return
+func (self *ElemStreamDesc) parseDescDepth(b []byte, offset, depth int) (n int, err error) {
+	if depth > 8 {
+		return 0, parseErr("descriptor nesting", offset, nil)
 	}
-
+	hdrlen, tag, datalen, err := self.parseDescHdr(b, offset)
+	if err != nil {
+		return 0, err
+	}
+	if datalen > len(b)-hdrlen {
+		return 0, parseErr("datalen", offset+hdrlen, nil)
+	}
+	payload := b[hdrlen : hdrlen+datalen]
+	childOffset := 0
 	switch tag {
 	case MP4ESDescrTag:
-		if len(b) < n+3 {
-			err = parseErr("MP4ESDescrTag", offset+n, err)
-			return
+		if len(payload) < 3 {
+			return 0, parseErr("MP4ESDescrTag", offset+hdrlen, nil)
 		}
-		if _, err = self.parseDesc(b[n+3:], offset+n+3); err != nil {
-			return
+		flags := payload[2]
+		childOffset = 3
+		if flags&0x80 != 0 {
+			childOffset += 2
+		} // dependsOn_ES_ID
+		if flags&0x40 != 0 { // URLlength and URLstring
+			if childOffset >= len(payload) {
+				return 0, parseErr("ES URL length", offset+hdrlen+childOffset, nil)
+			}
+			childOffset += 1 + int(payload[childOffset])
 		}
-
+		if flags&0x20 != 0 {
+			childOffset += 2
+		} // OCR_ES_Id
 	case MP4DecConfigDescrTag:
-		const size = 2+3+4+4
-		if len(b) < n+size {
-			err = parseErr("MP4DecSpecificDescrTag", offset+n, err)
-			return
-		}
-		if _, err = self.parseDesc(b[n+size:], offset+n+size); err != nil {
-			return
-		}
-
+		childOffset = 2 + 3 + 4 + 4
 	case MP4DecSpecificDescrTag:
-		self.DecConfig = b[n:]
+		self.DecConfig = payload
+		return hdrlen + datalen, nil
+	default:
+		return hdrlen + datalen, nil
 	}
-
-	n += datalen
-	return
+	if childOffset > len(payload) {
+		return 0, parseErr("descriptor fields", offset+hdrlen, nil)
+	}
+	for childOffset < len(payload) {
+		count, childErr := self.parseDescDepth(payload[childOffset:], offset+hdrlen+childOffset, depth+1)
+		if childErr != nil {
+			return 0, childErr
+		}
+		childOffset += count
+	}
+	return hdrlen + datalen, nil
 }
 
 func (self *ElemStreamDesc) parseLength(b []byte, offset int) (n int, length int, err error) {
@@ -353,9 +370,13 @@ func (self *ElemStreamDesc) parseLength(b []byte, offset int) (n int, length int
 		}
 		c := b[n]
 		n++
-		length = (length<<7)|(int(c)&0x7f)
+		length = (length << 7) | (int(c) & 0x7f)
 		if c&0x80 == 0 {
-			break
+			return
+		}
+		if n == 4 {
+			err = parseErr("unterminated descriptor length", offset+n-1, nil)
+			return
 		}
 	}
 	return

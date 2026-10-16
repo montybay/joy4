@@ -1,12 +1,13 @@
 package aacparser
 
 import (
-	"github.com/montybay/joy4/utils/bits"
-	"github.com/montybay/joy4/av"
 	"time"
 	"fmt"
 	"bytes"
 	"io"
+
+	"github.com/montybay/joy4/av"
+	"github.com/montybay/joy4/utils/bits"
 )
 
 // copied from libavcodec/mpeg4audio.h
@@ -63,12 +64,28 @@ const (
 	AOT_USAC            ///< N  Unified Speech and Audio Coding
 )
 
+// MPEG4AudioConfig retains the core rate/layout and all supported ASC fields.
+// CodecData.SampleRate and ChannelLayout report explicitly signaled SBR/PS output.
 type MPEG4AudioConfig struct {
 	SampleRate      int
 	ChannelLayout   av.ChannelLayout
 	ObjectType      uint
 	SampleRateIndex uint
 	ChannelConfig   uint
+
+	// SampleRate and ChannelLayout describe the core, as declared before SBR/PS.
+	BaseObjectType           uint // Core object type; ObjectType retains explicit SBR/PS signaling.
+	ExtensionSampleRate      int
+	ExtensionSampleRateIndex uint
+	SBRPresentFlag           bool
+	PSPresentFlag            bool
+	FrameLengthFlag          bool
+	DependsOnCoreCoder       bool
+	CoreCoderDelay           uint16
+	ExtensionFlag            bool
+	ExtensionFlag3           bool // Unsupported future syntax; true returns an error.
+	SyncExtensionPresent     bool
+	PSSyncExtensionPresent   bool
 }
 
 var sampleRateTable = []int{
@@ -149,66 +166,35 @@ func FillADTSHeader(header []byte, config MPEG4AudioConfig, samples int, payload
 	return
 }
 
-func readObjectType(r *bits.Reader) (objectType uint, err error) {
-	if objectType, err = r.ReadBits(5); err != nil {
-		return
+// CoreSamplesPerFrame returns the number of samples at SampleRate (the core rate).
+// SBR changes the output sample count and rate, not the frame duration.
+func (c MPEG4AudioConfig) CoreSamplesPerFrame() int {
+	if c.FrameLengthFlag {
+		return 960
 	}
-	if objectType == AOT_ESCAPE {
-		var i uint
-		if i, err = r.ReadBits(6); err != nil {
-			return
-		}
-		objectType = 32 + i
-	}
-	return
+	return 1024
 }
 
-func writeObjectType(w *bits.Writer, objectType uint) (err error) {
-	if objectType >= 32 {
-		if err = w.WriteBits(AOT_ESCAPE, 5); err != nil {
-			return
-		}
-		if err = w.WriteBits(objectType-32, 6); err != nil {
-			return
-		}
-	} else {
-		if err = w.WriteBits(objectType, 5); err != nil {
-			return
-		}
+// OutputSampleRate includes explicitly signaled SBR. Implicit SBR cannot be
+// determined from the ASC alone and requires inspecting decoded audio.
+func (c MPEG4AudioConfig) OutputSampleRate() int {
+	if c.SBRPresentFlag && c.ExtensionSampleRate != 0 {
+		return c.ExtensionSampleRate
 	}
-	return
+	return c.SampleRate
 }
 
-func readSampleRateIndex(r *bits.Reader) (index uint, err error) {
-	if index, err = r.ReadBits(4); err != nil {
-		return
+// OutputChannelLayout includes explicitly signaled parametric stereo.
+func (c MPEG4AudioConfig) OutputChannelLayout() av.ChannelLayout {
+	if c.PSPresentFlag {
+		return av.CH_FRONT_LEFT | av.CH_FRONT_RIGHT
 	}
-	if index == 0xf {
-		if index, err = r.ReadBits(24); err != nil {
-			return
-		}
-	}
-	return
-}
-
-func writeSampleRateIndex(w *bits.Writer, index uint) (err error) {
-	if index >= 0xf {
-		if err = w.WriteBits(0xf, 4); err != nil {
-			return
-		}
-		if err = w.WriteBits(index, 24); err != nil {
-			return
-		}
-	} else {
-		if err = w.WriteBits(index, 4); err != nil {
-			return
-		}
-	}
-	return
+	return c.ChannelLayout
 }
 
 func (self MPEG4AudioConfig) IsValid() bool {
-	return self.ObjectType > 0
+	_, err := normalizeAudioConfig(self)
+	return err == nil
 }
 
 func (self *MPEG4AudioConfig) Complete() {
@@ -221,55 +207,306 @@ func (self *MPEG4AudioConfig) Complete() {
 	return
 }
 
-func ParseMPEG4AudioConfigBytes(data []byte) (config MPEG4AudioConfig, err error) {
-	// copied from libavcodec/mpeg4audio.c avpriv_mpeg4audio_get_config()
-	r := bytes.NewReader(data)
-	br := &bits.Reader{R: r}
-	if config.ObjectType, err = readObjectType(br); err != nil {
-		return
-	}
-	if config.SampleRateIndex, err = readSampleRateIndex(br); err != nil {
-		return
-	}
-	if config.ChannelConfig, err = br.ReadBits(4); err != nil {
-		return
-	}
-	(&config).Complete()
-	return
+// ascReader tracks the exact ASC boundary, including unread bits buffered by bits.Reader.
+type ascReader struct {
+	r          bits.Reader
+	pos, total int
+	err        error
 }
 
-func WriteMPEG4AudioConfig(w io.Writer, config MPEG4AudioConfig) (err error) {
-	bw := &bits.Writer{W: w}
-	if err = writeObjectType(bw, config.ObjectType); err != nil {
-		return
+func (r *ascReader) read(n int) uint {
+	if r.err != nil {
+		return 0
 	}
+	if n < 0 || n > r.total-r.pos {
+		r.err = io.ErrUnexpectedEOF
+		return 0
+	}
+	v, err := r.r.ReadBits(n)
+	r.err = err
+	if err == nil {
+		r.pos += n
+	}
+	return v
+}
+func (r *ascReader) flag() bool { return r.read(1) != 0 }
+func (r *ascReader) frequency() (uint, int) {
+	index := r.read(4)
+	var rate int
+	if index == 15 {
+		rate = int(r.read(24))
+	} else if index < uint(len(sampleRateTable)) {
+		rate = sampleRateTable[index]
+	} else if r.err == nil {
+		r.err = fmt.Errorf("reserved sampling frequency index %d", index)
+	}
+	if r.err == nil && rate == 0 {
+		r.err = fmt.Errorf("zero sampling frequency")
+	}
+	return index, rate
+}
+func supportedGA(objectType uint) bool {
+	switch objectType {
+	case AOT_AAC_MAIN, AOT_AAC_LC, AOT_AAC_SSR, AOT_AAC_LTP:
+		return true
+	}
+	return false
+}
 
-	if config.SampleRateIndex == 0 {
-		for i, rate := range sampleRateTable {
-			if rate == config.SampleRate {
-				config.SampleRateIndex = uint(i)
+// ParseMPEG4AudioConfigBytes parses one complete, exactly bounded ASC. Main, LC,
+// SSR, LTP and explicit HE-AAC are supported. Program Config Elements (channel
+// configuration zero), ER/scalable profiles and future GA syntax return errors.
+func ParseMPEG4AudioConfigBytes(data []byte) (c MPEG4AudioConfig, err error) {
+	r := &ascReader{r: bits.Reader{R: bytes.NewReader(data)}, total: len(data) * 8}
+	c.ObjectType = r.read(5)
+	if c.ObjectType == AOT_ESCAPE {
+		c.ObjectType = 32 + r.read(6)
+	}
+	c.SampleRateIndex, c.SampleRate = r.frequency()
+	c.ChannelConfig = r.read(4)
+	if r.err != nil {
+		return c, fmt.Errorf("aacparser: ASC header: %w", r.err)
+	}
+	if c.ChannelConfig == 0 {
+		return c, fmt.Errorf("aacparser: channel configuration zero requires an unsupported Program Config Element")
+	}
+	c.BaseObjectType = c.ObjectType
+	if c.ObjectType == AOT_SBR || c.ObjectType == AOT_PS {
+		c.SBRPresentFlag = true
+		c.PSPresentFlag = c.ObjectType == AOT_PS
+		c.ExtensionSampleRateIndex, c.ExtensionSampleRate = r.frequency()
+		c.BaseObjectType = r.read(5)
+	}
+	if r.err != nil {
+		return c, fmt.Errorf("aacparser: HE configuration: %w", r.err)
+	}
+	if !supportedGA(c.BaseObjectType) {
+		return c, fmt.Errorf("aacparser: unsupported core object type %d", c.BaseObjectType)
+	}
+	c.FrameLengthFlag = r.flag()
+	c.DependsOnCoreCoder = r.flag()
+	if c.DependsOnCoreCoder {
+		c.CoreCoderDelay = uint16(r.read(14))
+	}
+	c.ExtensionFlag = r.flag()
+	if c.ExtensionFlag {
+		c.ExtensionFlag3 = r.flag()
+	}
+	if r.err != nil {
+		return c, fmt.Errorf("aacparser: GA configuration: %w", r.err)
+	}
+	if c.ExtensionFlag3 {
+		return c, fmt.Errorf("aacparser: unsupported extensionFlag3 syntax")
+	}
+	if r.total-r.pos > 7 {
+		if c.ObjectType == AOT_SBR || c.ObjectType == AOT_PS {
+			return c, fmt.Errorf("aacparser: unexpected extension after explicit HE configuration")
+		}
+		marker := r.read(11)
+		extensionType := r.read(5)
+		if r.err != nil {
+			return c, fmt.Errorf("aacparser: sync extension: %w", r.err)
+		}
+		if marker != 0x2b7 || extensionType != AOT_SBR {
+			return c, fmt.Errorf("aacparser: unsupported sync extension")
+		}
+		c.SyncExtensionPresent = true
+		c.SBRPresentFlag = r.flag()
+		if c.SBRPresentFlag {
+			c.ExtensionSampleRateIndex, c.ExtensionSampleRate = r.frequency()
+		}
+		if r.total-r.pos > 7 && r.err == nil {
+			marker = r.read(11)
+			c.PSSyncExtensionPresent = true
+			c.PSPresentFlag = r.flag()
+			if r.err == nil && marker != 0x548 {
+				return c, fmt.Errorf("aacparser: unsupported PS sync extension")
 			}
 		}
 	}
-	if err = writeSampleRateIndex(bw, config.SampleRateIndex); err != nil {
-		return
+	if r.err != nil {
+		return c, fmt.Errorf("aacparser: sync extension: %w", r.err)
 	}
+	if r.total-r.pos > 7 || r.read(r.total-r.pos) != 0 {
+		return c, fmt.Errorf("aacparser: invalid ASC padding")
+	}
+	return normalizeAudioConfig(c)
+}
 
-	if config.ChannelConfig == 0 {
+// normalizeFrequency preserves explicit (index 15) signaling and fills omitted
+// indexed rates for existing callers. Index zero is also the Go zero value;
+// when a rate is supplied without a nonzero index, the rate selects the index.
+func normalizeFrequency(index uint, rate int) (uint, int, error) {
+	if index > 15 || index == 13 || index == 14 {
+		return 0, 0, fmt.Errorf("aacparser: invalid sampling frequency index %d", index)
+	}
+	if rate == 0 && index < uint(len(sampleRateTable)) {
+		rate = sampleRateTable[index]
+	}
+	if rate <= 0 || rate > 0xffffff {
+		return 0, 0, fmt.Errorf("aacparser: invalid sampling frequency %d", rate)
+	}
+	if index == 15 {
+		return index, rate, nil
+	}
+	if index != 0 && sampleRateTable[index] != rate {
+		return 0, 0, fmt.Errorf("aacparser: sample rate/index mismatch")
+	}
+	for i, v := range sampleRateTable {
+		if v == rate {
+			return uint(i), rate, nil
+		}
+	}
+	return 15, rate, nil
+}
+
+func normalizeAudioConfig(c MPEG4AudioConfig) (MPEG4AudioConfig, error) {
+	explicitHE := c.ObjectType == AOT_SBR || c.ObjectType == AOT_PS
+	if !explicitHE && !supportedGA(c.ObjectType) {
+		return c, fmt.Errorf("aacparser: unsupported object type %d", c.ObjectType)
+	}
+	if c.BaseObjectType == 0 {
+		c.BaseObjectType = c.ObjectType
+		if explicitHE {
+			c.BaseObjectType = AOT_AAC_LC
+		}
+	}
+	if !supportedGA(c.BaseObjectType) || (!explicitHE && c.BaseObjectType != c.ObjectType) {
+		return c, fmt.Errorf("aacparser: invalid core object type %d", c.BaseObjectType)
+	}
+	if c.ChannelConfig == 0 && c.ChannelLayout != 0 {
 		for i, layout := range chanConfigTable {
-			if layout == config.ChannelLayout {
-				config.ChannelConfig = uint(i)
+			if layout == c.ChannelLayout {
+				c.ChannelConfig = uint(i)
+				break
 			}
 		}
 	}
-	if err = bw.WriteBits(config.ChannelConfig, 4); err != nil {
-		return
+	if c.ChannelConfig == 0 {
+		return c, fmt.Errorf("aacparser: channel configuration zero requires an unsupported Program Config Element")
 	}
+	if c.ChannelConfig >= uint(len(chanConfigTable)) {
+		return c, fmt.Errorf("aacparser: unsupported channel configuration %d", c.ChannelConfig)
+	}
+	c.ChannelLayout = chanConfigTable[c.ChannelConfig]
+	var err error
+	c.SampleRateIndex, c.SampleRate, err = normalizeFrequency(c.SampleRateIndex, c.SampleRate)
+	if err != nil {
+		return c, err
+	}
+	if explicitHE {
+		if c.SyncExtensionPresent || c.PSSyncExtensionPresent {
+			return c, fmt.Errorf("aacparser: explicit HE with sync extension")
+		}
+		c.SBRPresentFlag = true
+		if c.ObjectType == AOT_PS {
+			c.PSPresentFlag = true
+		} else if c.PSPresentFlag {
+			return c, fmt.Errorf("aacparser: PS requires AOT_PS or a PS sync extension")
+		}
+	}
+	if c.SBRPresentFlag {
+		if !explicitHE && !c.SyncExtensionPresent {
+			return c, fmt.Errorf("aacparser: SBR requires sync signaling")
+		}
+		// Unlike the base rate, an extension rate must be explicitly supplied.
+		if c.ExtensionSampleRate == 0 && c.ExtensionSampleRateIndex == 0 {
+			return c, fmt.Errorf("aacparser: missing extension sample rate")
+		}
+		c.ExtensionSampleRateIndex, c.ExtensionSampleRate, err = normalizeFrequency(c.ExtensionSampleRateIndex, c.ExtensionSampleRate)
+		if err != nil {
+			return c, err
+		}
+	} else if c.ExtensionSampleRate != 0 || c.ExtensionSampleRateIndex != 0 {
+		return c, fmt.Errorf("aacparser: extension rate without SBR")
+	}
+	if c.PSSyncExtensionPresent && !c.SyncExtensionPresent {
+		return c, fmt.Errorf("aacparser: PS sync extension without SBR sync extension")
+	}
+	if c.PSPresentFlag && (!c.SBRPresentFlag || (!explicitHE && !c.PSSyncExtensionPresent)) {
+		return c, fmt.Errorf("aacparser: invalid PS signaling")
+	}
+	if c.CoreCoderDelay > 0x3fff || (!c.DependsOnCoreCoder && c.CoreCoderDelay != 0) {
+		return c, fmt.Errorf("aacparser: invalid core coder delay")
+	}
+	if c.ExtensionFlag3 {
+		return c, fmt.Errorf("aacparser: unsupported extensionFlag3 syntax")
+	}
+	return c, nil
+}
 
-	if err = bw.FlushBits(); err != nil {
-		return
+// A small byte-oriented writer avoids utils/bits.Writer's 64-bit boundary
+// behavior when both core and extension frequencies are explicitly encoded.
+type ascWriter struct {
+	data []byte
+	pos  int
+}
+
+func (w *ascWriter) write(v uint, n int) {
+	for bit := n - 1; bit >= 0; bit-- {
+		if w.pos%8 == 0 {
+			w.data = append(w.data, 0)
+		}
+		w.data[w.pos/8] |= byte((v>>uint(bit))&1) << uint(7-w.pos%8)
+		w.pos++
 	}
-	return
+}
+func (w *ascWriter) flag(v bool) {
+	if v {
+		w.write(1, 1)
+	} else {
+		w.write(0, 1)
+	}
+}
+func (w *ascWriter) frequency(index uint, rate int) {
+	w.write(index, 4)
+	if index == 15 {
+		w.write(uint(rate), 24)
+	}
+}
+
+// WriteMPEG4AudioConfig serializes the complete supported configuration. Invalid
+// configurations return an error without writing any bytes. Original ASC bytes
+// in CodecData remain available for remuxing without reconstruction.
+func WriteMPEG4AudioConfig(dst io.Writer, config MPEG4AudioConfig) error {
+	c, err := normalizeAudioConfig(config)
+	if err != nil {
+		return err
+	}
+	w := &ascWriter{}
+	w.write(c.ObjectType, 5)
+	w.frequency(c.SampleRateIndex, c.SampleRate)
+	w.write(c.ChannelConfig, 4)
+	if c.ObjectType == AOT_SBR || c.ObjectType == AOT_PS {
+		w.frequency(c.ExtensionSampleRateIndex, c.ExtensionSampleRate)
+		w.write(c.BaseObjectType, 5)
+	}
+	w.flag(c.FrameLengthFlag)
+	w.flag(c.DependsOnCoreCoder)
+	if c.DependsOnCoreCoder {
+		w.write(uint(c.CoreCoderDelay), 14)
+	}
+	w.flag(c.ExtensionFlag)
+	if c.ExtensionFlag {
+		w.flag(c.ExtensionFlag3)
+	}
+	if c.SyncExtensionPresent {
+		w.write(0x2b7, 11)
+		w.write(AOT_SBR, 5)
+		w.flag(c.SBRPresentFlag)
+		if c.SBRPresentFlag {
+			w.frequency(c.ExtensionSampleRateIndex, c.ExtensionSampleRate)
+		}
+		if c.PSSyncExtensionPresent {
+			w.write(0x548, 11)
+			w.flag(c.PSPresentFlag)
+		}
+	}
+	n, err := dst.Write(w.data)
+	if err == nil && n != len(w.data) {
+		err = io.ErrShortWrite
+	}
+	return err
 }
 
 type CodecData struct {
@@ -286,11 +523,11 @@ func (self CodecData) MPEG4AudioConfigBytes() []byte {
 }
 
 func (self CodecData) ChannelLayout() av.ChannelLayout {
-	return self.Config.ChannelLayout
+	return self.Config.OutputChannelLayout()
 }
 
 func (self CodecData) SampleRate() int {
-	return self.Config.SampleRate
+	return self.Config.OutputSampleRate()
 }
 
 func (self CodecData) SampleFormat() av.SampleFormat {
@@ -298,13 +535,18 @@ func (self CodecData) SampleFormat() av.SampleFormat {
 }
 
 func (self CodecData) PacketDuration(data []byte) (dur time.Duration, err error) {
-	dur = time.Duration(1024) * time.Second / time.Duration(self.Config.SampleRate)
+	if self.Config.SampleRate <= 0 {
+		return 0, fmt.Errorf("aacparser: invalid core sample rate")
+	}
+	dur = time.Duration(self.Config.CoreSamplesPerFrame()) * time.Second / time.Duration(self.Config.SampleRate)
 	return
 }
 
 func NewCodecDataFromMPEG4AudioConfig(config MPEG4AudioConfig) (self CodecData, err error) {
 	b := &bytes.Buffer{}
-	WriteMPEG4AudioConfig(b, config)
+	if err = WriteMPEG4AudioConfig(b, config); err != nil {
+		return
+	}
 	return NewCodecDataFromMPEG4AudioConfigBytes(b.Bytes())
 }
 
